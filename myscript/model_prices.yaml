@@ -1,0 +1,13 @@
+currency: CNY
+tokens_per_unit: 1000000
+
+models:
+  openai/gpt-6.1-sol:
+    uncached_input: 1.2556
+    output: 7.5338
+    cached_input: 0.125564
+  openai/gpt-6.2-sol: &gpt_6_2_sol
+    uncached_input: 1.0045
+    output: 5.0226
+    cached_input: 0.100451
+  openai/icloud99/gpt-6.2-sol: *gpt_6_2_sol

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.utils.log import logger, logtime
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -85,6 +86,7 @@ class DefaultAgent:
             )
         )
 
+    @logtime(logger)
     def run(self, task: str = "", **kwargs) -> dict:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
@@ -127,6 +129,7 @@ class DefaultAgent:
         """Query the LM, execute actions."""
         return self.execute_actions(self.query())
 
+    @logtime(logger)
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
         if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
@@ -151,6 +154,7 @@ class DefaultAgent:
         self.add_messages(message)
         return message
 
+    @logtime(logger)
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
         outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]

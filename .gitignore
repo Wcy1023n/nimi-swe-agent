@@ -9,6 +9,17 @@ traj.json
 .claude/**
 .vscode/**
 
+# Keep scripts and report pricing under myscript.
+/myscript/**
+!/myscript/**/
+!/myscript/**/*.py
+!/myscript/**/*.sh
+!/myscript/**/*.bash
+!/myscript/**/*.zsh
+!/myscript/model_prices.yaml
+/myscript/results/
+/myscript/**/__pycache__/
+
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 

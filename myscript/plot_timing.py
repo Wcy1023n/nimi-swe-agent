@@ -1,0 +1,315 @@
+"""Plot serial runs: python myscript/plot_timing.py RESULTS_DIRECTORY."""
+
+from datetime import datetime
+from decimal import Decimal
+from html import escape
+from pathlib import Path
+
+import typer
+import yaml
+from jinja2 import Environment
+
+if __package__:
+    from .count_time import Task, analyze, finite_number, read_tasks
+    from .count_tokens import ENCODING
+else:
+    from count_time import Task, analyze, finite_number, read_tasks
+    from count_tokens import ENCODING
+
+PRICE_FILE = Path(__file__).with_name("model_prices.yaml")
+COLORS = {"query": "#2563eb", "tool": "#94a3b8", "other": "#e2e8f0"}
+TEMPLATE = Environment(autoescape=True)
+
+
+def money(value: float | None) -> str:
+    return "不可用" if value is None else f"${value:.6f}"
+
+
+def timeline(task: Task, stats: dict, *, compact: bool = False) -> str:
+    if stats["total"] is None:
+        return '<span class="note">无计时数据</span>'
+    total, origin = stats["total"], stats["origin"]
+    segments, ticks, query_rows = [], [], []
+    queries = [event for event in task.events if event.kind == "query"]
+    counts = {"query": 0, "tool": 0}
+    for event in stats["calls"]:
+        counts[event.kind] += 1
+        start, end = (event.start - origin).total_seconds(), (event.end - origin).total_seconds()
+        x = 40 + max(0, start) / total * 1040
+        width = max(0, min(total, end) - max(0, start)) / total * 1040
+        label = f"{event.kind} #{counts[event.kind]}: {start:.3f}–{end:.3f}s · 耗时 {event.seconds:.3f}s"
+        short_tokens = ""
+        if event.kind == "query":
+            index = queries.index(event)
+            price = money(task.query_costs.get(index))
+            tokens = task.query_input_tokens.get(index)
+            exact_tokens = "不可用" if tokens is None else f"{tokens:,}"
+            label += f" · 输入 Token {exact_tokens} · 轨迹费用 {price}"
+            if tokens is not None and not compact:
+                short_tokens = str(tokens) if tokens < 1000 else f"{tokens / 1000:.1f}".removesuffix(".0") + "k"
+                if tokens >= 1000 and width < 8 * len(short_tokens) + 4:
+                    short_tokens = f"{tokens / 1000:.0f}k"
+            if not compact:
+                query_rows.append(
+                    f'<tr><th scope="row">#{counts["query"]}</th><td>{start:.3f}–{end:.3f} s</td>'
+                    f'<td>{event.seconds:.3f} s</td><td>{exact_tokens}</td><td>{price}</td></tr>'
+                )
+        segments.append(
+            f'<rect x="{x:.6f}" y="30" width="{width:.6f}" height="48" '
+            f'fill="{COLORS[event.kind]}"><title>{escape(label)}</title></rect>'
+        )
+        if short_tokens and width >= 8 * len(short_tokens) + 4:
+            segments.append(
+                f'<text class="query-tokens" x="{x + width / 2:.6f}" y="58" text-anchor="middle">{short_tokens}</text>'
+            )
+    if not compact:
+        for index in range(6):
+            x = 40 + index / 5 * 1040
+            ticks.append(f'<path d="M{x} 80v8" stroke="#64748b"/>'
+                         f'<text x="{x}" y="110" text-anchor="middle">{total * index / 5:.2f}s</text>')
+    axis = (
+        f'<svg viewBox="{ "40 30 1040 48" if compact else "0 0 1120 135" }" '
+        f'role="img" aria-label="等比例时间轴">'
+        f'<rect x="40" y="30" width="1040" height="48" fill="{COLORS["other"]}"/>'
+        f'{"".join(segments)}{"".join(ticks)}</svg>'
+    )
+    if not query_rows:
+        return axis
+    return (
+        f'{axis}<details class="query-details"><summary>逐次 Query 明细（{len(query_rows)} 次）</summary>'
+        '<div class="table-scroll"><table><thead><tr><th scope="col">Query</th><th scope="col">时间区间</th>'
+        '<th scope="col">耗时</th><th scope="col">输入 Token</th><th scope="col">轨迹费用（USD）</th></tr></thead>'
+        f'<tbody>{"".join(query_rows)}</tbody></table></div></details>'
+    )
+
+
+def charts(task: Task, stats: dict) -> str:
+    if stats["total"] is None:
+        return ""
+    circles, rows, offset = [], [], 0.0
+    labels = {"query": "Query · 查询阶段", "tool": "Tool · 工具阶段", "other": "其他或未记录"}
+    for kind, seconds in stats["totals"].items():
+        percent = seconds / stats["total"] * 100
+        if percent:
+            circles.append(
+                f'<circle cx="120" cy="120" r="88" fill="none" stroke="{COLORS[kind]}" '
+                f'stroke-width="32" pathLength="100" stroke-dasharray="{percent:.7f} {100 - percent:.7f}" '
+                f'stroke-dashoffset="{-offset:.7f}" transform="rotate(-90 120 120)">'
+                f'<title>{labels[kind]}: {seconds:.3f}s ({percent:.2f}%)</title></circle>'
+            )
+        offset += percent
+        count = str(sum(event.kind == kind for event in stats["calls"])) if kind != "other" else "—"
+        rows.append(
+            f'<tr><td><span class="swatch" style="background:{COLORS[kind]}"></span>{labels[kind]}</td>'
+            f'<td>{seconds:.3f} s</td><td>{percent:.2f}%</td><td>{count}</td></tr>'
+        )
+    return TEMPLATE.from_string('''
+<section><h2>1. 总体时间占比</h2><div class="overview">
+<svg class="donut" viewBox="0 0 240 240" role="img" aria-label="总体时间占比">
+{{ circles | safe }}
+<text x="120" y="106" text-anchor="middle" style="font-size:24px;fill:#0f172a">{{ '%.2f' | format(total) }}s</text>
+<text x="120" y="129" text-anchor="middle" style="font-size:12px">{{ scope }}</text>
+<text x="120" y="149" text-anchor="middle" style="font-size:12px">轨迹总费用 {{ cost }}</text></svg>
+<div class="table-scroll"><table><thead><tr><th>类别</th><th>累计耗时</th><th>占比</th><th>阶段次数</th></tr></thead>
+<tbody>{{ rows | safe }}</tbody></table></div></div>
+<p class="note">run 已包含 query、tool 和其他处理时间，不能重复相加。</p></section>
+<section><h2>2. 线性时间轴</h2>
+<p><span class="swatch" style="background:#2563eb"></span>Query
+　<span class="swatch" style="background:#94a3b8"></span>Tool
+　<span class="swatch" style="background:#e2e8f0"></span>其他或未记录</p>
+<div class="timeline">{{ timeline | safe }}</div>
+<p class="note">上下文压缩：无独立计时记录，无法标注发生时间和耗时。</p>
+<p class="note">长度与秒数成比例，保留间隔。色块数字为 API 记录的输入 Token（k = 千）；悬停或展开明细可查看精确数量和费用。
+execute_actions 包含一轮全部工具执行及结果处理，并非单个工具；旧版 execute 仍表示单个工具。
+query 包含模型请求及 agent 前后处理。位置由日志结束时间减去耗时近似还原（毫秒精度），不是精确 tracing。
+区间不包含 run 之前的镜像拉取和容器启动。</p></section>
+''').render(circles="".join(circles), rows="".join(rows), total=stats["total"], scope=stats["scope"], cost=money(task.cost), timeline=timeline(task, stats))
+
+
+def estimate_price(task: Task, rates: dict, tokens_per_unit: int) -> tuple[Decimal, ...] | None:
+    model_rates = rates.get(task.model_name)
+    if model_rates is None:
+        return None
+    keys = ("uncached_input", "cached_input", "output")
+    if any(finite_number(model_rates.get(key)) is None for key in keys):
+        raise typer.BadParameter(f"{PRICE_FILE.name}: {task.model_name} 需要三项非负单价：{', '.join(keys)}。")
+    tokens = task.token_breakdown
+    return tuple(
+        count * Decimal(str(model_rates[key])) / tokens_per_unit
+        for count, key in zip((tokens.uncached + tokens.unknown_input, tokens.cached, tokens.output), keys)
+    )
+
+
+def render_report(tasks: list[Task]) -> str:
+    pricing = yaml.safe_load(PRICE_FILE.read_text(encoding="utf-8"))
+    tokens_per_unit = pricing["tokens_per_unit"]
+    if type(tokens_per_unit) is not int or tokens_per_unit <= 0:
+        raise typer.BadParameter(f"{PRICE_FILE.name}: tokens_per_unit 必须是正整数。")
+    currency = pricing["currency"]
+    price_format = ("¥" if currency == "CNY" else f"{currency} ") + "{:,.6f}"
+    items = []
+    for task in tasks:
+        stats = analyze(task)
+        items.append({"task": task, "stats": stats, "duration": f'{stats["total"]:.3f} s' if stats["total"] is not None else "不可用",
+                      "money": money(task.cost), "preview": timeline(task, stats, compact=True), "charts": charts(task, stats),
+                      "price": estimate_price(task, pricing["models"], tokens_per_unit)})
+    return TEMPLATE.from_string('''<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 多题耗时与 Token 分析</title><style>
+body { margin:32px auto; padding:0 24px; max-width:1120px; color:#0f172a; background:#f8fafc; font:16px/1.6 system-ui,sans-serif; }
+h1 { margin-bottom:0; } h2 { margin-top:0; } section { background:white; border:1px solid #e2e8f0; border-radius:12px; padding:24px; margin:24px 0; }
+.task-list { max-height:300px; overflow-y:auto; display:grid; gap:8px; padding:4px; }
+.task-button { display:grid; grid-template-columns:minmax(180px,1fr) minmax(150px,1.2fr) 130px; gap:16px; align-items:center; width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; background:white; color:inherit; text-align:left; cursor:pointer; font:inherit; }
+.task-button[aria-pressed="true"] { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px #2563eb; }
+.task-button[data-benchmark="passed"] { border-inline-start:4px solid #15803d; background:#f0fdf4; }
+.task-button:is([data-benchmark="failed"], [data-benchmark="empty-patch"]) { border-inline-start:4px solid #b91c1c; background:#fef2f2; }
+.bench-status { display:block; color:#475569; font-size:13px; }
+[data-benchmark="passed"] .bench-status { color:#166534; }
+:is([data-benchmark="failed"], [data-benchmark="empty-patch"]) .bench-status { color:#991b1b; }
+.task-button:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
+.task-name { display:block; font-size:13px; color:#475569; overflow-wrap:anywhere; } .task-id { overflow-wrap:anywhere; }
+.preview svg { width:100%; height:20px; display:block; border-radius:3px; } .metrics { text-align:right; font-size:14px; }
+.overview { display:flex; align-items:center; flex-wrap:wrap; gap:24px; } .donut { width:240px; height:240px; flex-shrink:0; }
+.table-scroll { overflow-x:auto; flex:1; } table { border-collapse:collapse; width:100%; } th,td { text-align:right; padding:12px; white-space:nowrap; }
+th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid #e2e8f0; }
+.swatch { display:inline-block; width:12px; height:12px; margin-right:8px; border-radius:3px; }
+.warning { padding:12px 16px; background:#fef3c7; border-left:4px solid #f59e0b; }
+.note { color:#475569; font-size:14px; overflow-wrap:anywhere; } .summary { display:flex; flex-wrap:wrap; gap:8px 28px; }
+.timeline { overflow-x:auto; } .timeline svg { width:100%; min-width:650px; } svg text { font:14px system-ui,sans-serif; fill:#475569; }
+.timeline .query-tokens { fill:white; font-size:12px; pointer-events:none; }
+.query-details summary { cursor:pointer; }
+.token-bar { display:flex; height:20px; overflow:hidden; border-radius:4px; }
+.token-bar span { flex:0 0 auto; }
+.token-legend { display:flex; flex-wrap:wrap; gap:8px 28px; list-style:none; padding:0; }
+.token-legend strong { white-space:nowrap; }
+[hidden] { display:none !important; } @media(max-width:650px) { .task-button { grid-template-columns:1fr 110px; } .preview { grid-column:1/-1; grid-row:2; } section { padding:16px; } }
+</style></head><body>
+{% macro breakdown_bar(values, number_format, suffix='', unknown_input=0) %}
+{% set total = (values | sum) + unknown_input %}
+{% set segments = [
+    ('Prefill · 缓存未命中', '#1d4ed8', values[0]),
+    ('Prefill · 缓存命中', '#4495ec', values[1]),
+    ('Decode · 输出', '#6b7280', values[2]),
+] %}
+{% if unknown_input %}{% set segments = segments[:2] + [('Prefill · 缓存状态未知', '#0e7490', unknown_input)] + segments[2:] %}{% endif %}
+{% if total > 0 %}
+<div class="token-bar" aria-hidden="true">
+{% for label, color, value in segments if value > 0 %}
+<span style="width:{{ '%.9f' | format(100 * (value / total)) }}%;background:{{ color }}" title="{{ label }} · {{ number_format.format(value) }}{{ suffix }}"></span>
+{% endfor %}
+</div>
+{% endif %}
+<ul class="token-legend">
+{% for label, color, value in segments %}
+<li><span class="swatch" style="background:{{ color }}"></span>{{ label }} <strong>{{ number_format.format(value) }}{% if total > 0 %} · {{ '%.1f' | format(100 * (value / total)) }}%{% endif %}</strong></li>
+{% endfor %}
+</ul>
+{% endmacro %}
+<h1>Agent 多题耗时与 Token 分析</h1><p>{{ items | length }} 个运行记录 · 离线报告</p>
+<section><h2>选择题目</h2><p class="note">上下滚动查看题目，点击切换下方图表和 Token 统计。同一 ID 的不同运行由来源路径区分。
+缩略轴各自压缩到相同宽度，仅比较阶段分布；跨题总耗时请看秒数。</p>
+{% set benchmark_labels = {'passed': '评测成功', 'failed': '评测失败', 'empty-patch': '评测失败 · 空补丁', 'error': '评测出错'} %}
+<div class="task-list" aria-label="题目列表">
+{% for item in items %}<button type="button" class="task-button" data-benchmark="{{ item.task.benchmark_status or 'unknown' }}" data-task="{{ loop.index0 }}" aria-controls="task-{{ loop.index0 }}" aria-pressed="{{ 'true' if loop.first else 'false' }}">
+<span><strong class="task-id">{{ item.task.id }}</strong><span class="bench-status">{{ benchmark_labels.get(item.task.benchmark_status, '无评测结果') }}</span><span class="task-name">{{ item.task.title }}</span><span class="task-name">{{ item.task.source }}</span></span>
+<span class="preview">{{ item.preview | safe }}</span><span class="metrics">{{ item.duration }}<br>轨迹 {{ item.money }}</span></button>{% endfor %}
+</div></section>
+{% for item in items %}<article id="task-{{ loop.index0 }}" class="task-panel" {% if not loop.first %}hidden{% endif %}>
+<h2>{{ item.task.id }}</h2><p>{{ item.task.title }}</p><p class="note">来源：{{ item.task.source }}</p>
+<div class="summary"><strong>{{ item.stats.scope }}：{{ item.duration }}</strong>
+{% if item.stats.total is none %}<strong>轨迹总费用：{{ item.money }}</strong>{% endif %}
+<span>API 调用：{{ item.task.api_calls if item.task.api_calls is not none else '不可用' }}</span><span>Agent 状态：{{ item.task.status }}</span></div>
+{% for warning in item.stats.warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
+{{ item.charts | safe }}
+{% set tokens = item.task.token_breakdown %}
+{% set calls = [tokens.responses, item.task.api_calls or 0] | max %}
+{% set coverage %}覆盖 {{ tokens.covered }} / {{ calls }} 次 API 调用{% endset %}
+{% set usage_missing %}其余 {{ calls - tokens.covered }} 次调用缺少有效的输入或输出 Token 数。{% endset %}
+<section><h2>Token 构成</h2>
+{% if tokens.covered %}
+<p><strong>{{ '{:,}'.format(tokens.uncached + tokens.cached + tokens.unknown_input + tokens.output) }} Token</strong> · {{ coverage }}</p>
+{{ breakdown_bar([tokens.uncached, tokens.cached, tokens.output], '{:,}', ' Token', tokens.unknown_input) }}
+{% if tokens.unknown_rounds %}<p class="note">{{ tokens.unknown_rounds }} 次调用缺少有效的缓存命中数，其输入归为「缓存状态未知」。</p>{% endif %}
+{% if tokens.covered < calls %}<p class="note">{{ usage_missing }}</p>{% endif %}
+{% else %}
+<p class="note">没有同时提供有效输入和输出 Token 数的调用（{{ coverage }}）。</p>
+{% endif %}
+</section>
+<section><h2>费用构成</h2>
+{% if item.price is none %}
+<p class="note">{% if item.task.model_name %}{{ item.task.model_name }} 在 {{ price_file }} 中没有单价配置。{% else %}轨迹中未记录模型名。{% endif %}</p>
+{% elif tokens.covered %}
+<p>中转站估算小计 <strong>{{ price_format.format(item.price | sum) }}</strong> · {{ coverage }}</p>
+{{ breakdown_bar(item.price, price_format) }}
+<p class="note">按 {{ price_file }} 中 {{ item.task.model_name }} 的单价估算（{{ currency }}）。{% if tokens.unknown_rounds %}这 {{ tokens.unknown_rounds }} 次缺少有效缓存命中数的输入按未命中单价估算。{% endif %}{% if tokens.covered < calls %}{{ usage_missing }}{% endif %}</p>
+{% else %}
+<p class="note">没有同时提供有效输入和输出 Token 数的调用（{{ coverage }}）。</p>
+{% endif %}
+</section>
+<section><h2>输入 Token 统计</h2>
+{% set tokens = item.task.input_tokens %}
+{% if tokens is not none %}
+<p>覆盖 {{ tokens.rounds }} 轮 · API 记录的输入 Token：{{ '{:,}'.format(tokens.api_prompt) if tokens.api_prompt is not none else '不可用' }}</p>
+<p>输入 Token 缓存命中率：{% if tokens.cache_hit_rate is not none %}<strong>{{ '{:.1%}'.format(tokens.cache_hit_rate) }}</strong>
+（{{ '{:,}'.format(tokens.cached_prompt) }} / {{ '{:,}'.format(tokens.cache_prompt) }} Token）{% else %}不可用{% endif %}
+· 缓存数据覆盖 {{ tokens.cache_rounds }} / {{ tokens.rounds }} 轮</p>
+{% if tokens.cache_rounds < tokens.rounds %}<p class="note">未上报有效缓存数据的轮次不计入命中率。</p>{% endif %}
+<div class="table-scroll"><table><thead><tr><th scope="col">消息类别</th><th scope="col">累计估算 Token</th><th scope="col">占估算输入</th></tr></thead><tbody>
+{% set tool = tokens.by_role.get('tool', 0) %}
+{% set assistant = tokens.by_role.get('assistant', 0) %}
+{% for label, count in [
+    ('system · 系统提示', tokens.by_role.get('system', 0)),
+    ('user · 用户消息', tokens.by_role.get('user', 0)),
+    ('assistant · 模型回复（含工具调用）', assistant),
+    ('tool · 工具返回', tool),
+    ('tool + assistant 小计', tool + assistant),
+    ('全部输入消息', tokens.total),
+] %}
+<tr><td>{{ label }}</td><td>{{ '{:,}'.format(count) }}</td><td>{{ '%.1f%%' | format(100 * count / tokens.total) }}</td></tr>
+{% endfor %}
+</tbody></table></div>
+<p class="note">使用 {{ encoding }} 按轨迹估算。历史消息每随请求发送一次就计一次。占比以本地估算的全部消息 Token 为分母，API 总数供参考。</p>
+{% else %}
+<p class="note">没有可用于重建请求的 Chat Completions 回复记录。</p>
+{% endif %}
+</section></article>{% endfor %}
+<p class="note">轨迹费用（USD）由 LiteLLM 在运行时记录。中转站估算（{{ currency }}）使用报告生成时的配置单价和用量覆盖范围。
+仅支持单个日志内 --workers 1 的串行运行；不同独立日志可以汇总。报告为生成时的快照，不会自动刷新。</p>
+<script>
+const buttons = document.querySelectorAll('.task-button');
+const panels = document.querySelectorAll('.task-panel');
+buttons.forEach(button => button.addEventListener('click', () => {
+  buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+  panels.forEach(panel => { panel.hidden = panel.id !== 'task-' + button.dataset.task; });
+}));
+</script></body></html>''').render(items=items, encoding=ENCODING, price_format=price_format, currency=currency, price_file=PRICE_FILE.name)
+
+
+def main(
+    results: Path = typer.Argument(..., exists=True, file_okay=False, readable=True, help="包含串行运行日志和轨迹的结果目录"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="HTML 输出路径，默认放在 myscript/results/plot_timing"),
+    evaluation: Path | None = typer.Option(
+        None, "--evaluation", exists=True, dir_okay=False, readable=True,
+        help="单次运行对应的 SWE-bench 评测汇总 JSON，默认读取日志旁的 results.json",
+    ),
+) -> None:
+    output = output or Path(__file__).parent / "results" / "plot_timing" / f"{datetime.now():%Y%m%d-%H%M%S-%f}.html"
+    if output.exists():
+        raise typer.BadParameter(f"输出文件已存在，请换一个路径：{output}")
+    logs = sorted(results.rglob("minisweagent.log"))
+    if not logs:
+        raise typer.BadParameter("没有找到 minisweagent.log。")
+    if evaluation is not None and len(logs) != 1:
+        raise typer.BadParameter("--evaluation 需要结果目录内只有一个 minisweagent.log；汇总多次运行时请将各自的 results.json 放在对应日志旁。")
+    tasks = [task for path in logs for task in read_tasks(path, str(path.relative_to(results)), evaluation)]
+    if not tasks:
+        raise typer.BadParameter("没有找到计时记录或轨迹文件。")
+    report = render_report(tasks)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x", encoding="utf-8") as file:
+        file.write(report)
+    typer.echo(f"报告已生成（{len(tasks)} 个运行记录）：{output.resolve()}")
+
+
+if __name__ == "__main__":
+    typer.run(main)

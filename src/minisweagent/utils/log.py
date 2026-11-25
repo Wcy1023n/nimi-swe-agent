@@ -1,4 +1,7 @@
 import logging
+import time
+from collections.abc import Callable
+from functools import wraps
 from pathlib import Path
 
 from rich.logging import RichHandler
@@ -33,4 +36,21 @@ _setup_root_logger()
 logger = logging.getLogger("minisweagent")
 
 
-__all__ = ["logger"]
+def logtime(log: logging.Logger, msg: str | None = None) -> Callable:
+    """Log execution time, including calls that raise, without changing their outcome."""
+
+    def decorate(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                log.debug("%s: Elapsed time %.7f secs", msg or func.__qualname__, time.perf_counter() - start)
+
+        return wrapper
+
+    return decorate
+
+
+__all__ = ["logger", "logtime"]
