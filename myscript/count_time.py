@@ -10,9 +10,9 @@ from pathlib import Path
 import typer
 
 if __package__:
-    from .count_tokens import InputTokens, TokenBreakdown, api_prompt_tokens, count_input_tokens, count_token_breakdown
+    from .count_tokens import TokenBreakdown, api_prompt_tokens, count_token_breakdown
 else:
-    from count_tokens import InputTokens, TokenBreakdown, api_prompt_tokens, count_input_tokens, count_token_breakdown
+    from count_tokens import TokenBreakdown, api_prompt_tokens, count_token_breakdown
 
 PATTERN = re.compile(
     r"^(?P<end>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - .*? - "
@@ -45,7 +45,6 @@ class Task:
     query_costs: dict[int, float] = field(default_factory=dict)
     query_input_tokens: dict[int, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
-    input_tokens: InputTokens | None = None
     token_breakdown: TokenBreakdown = field(default_factory=TokenBreakdown)
     model_name: str | None = None
     benchmark_status: str | None = None
@@ -95,7 +94,6 @@ def add_trajectory(task: Task, path: Path | None) -> None:
     task.api_calls = stats.get("api_calls")
     task.status = info.get("exit_status") or "未完成"
     messages = data.get("messages", [])
-    task.input_tokens = count_input_tokens(messages)
     task.token_breakdown = count_token_breakdown(messages)
     prompt = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
     description = re.search(r"<pr_description>(.*?)</pr_description>", prompt, re.DOTALL) if isinstance(prompt, str) else None
@@ -108,7 +106,7 @@ def add_trajectory(task: Task, path: Path | None) -> None:
     records = []
     for message in messages:
         extra = message.get("extra", {})
-        tokens = api_prompt_tokens(extra.get("response"))
+        tokens = api_prompt_tokens(message if message.get("object") == "response" else extra.get("response"))
         if "cost" in extra or tokens is not None:
             records.append((extra, tokens))
     candidates = []

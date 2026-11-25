@@ -6,6 +6,7 @@ preds.json
 *.traj.json
 .env
 traj.json
+timing-report*.html
 .claude/**
 .vscode/**
 
@@ -17,7 +18,10 @@ traj.json
 !/myscript/**/*.bash
 !/myscript/**/*.zsh
 !/myscript/model_prices.yaml
+!/myscript/README.md
+!/myscript/rtk.yaml
 /myscript/results/
+/myscript/assets/
 /myscript/**/__pycache__/
 
 # Created by https://www.toptal.com/developers/gitignore/api/python

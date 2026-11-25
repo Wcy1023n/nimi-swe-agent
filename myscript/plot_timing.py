@@ -11,10 +11,8 @@ from jinja2 import Environment
 
 if __package__:
     from .count_time import Task, analyze, read_tasks
-    from .count_tokens import ENCODING
 else:
     from count_time import Task, analyze, read_tasks
-    from count_tokens import ENCODING
 
 COLORS = {"query": "#2563eb", "tool": "#94a3b8", "other": "#e2e8f0"}
 TEMPLATE = Environment(autoescape=True)
@@ -129,7 +127,13 @@ def price_breakdown(task: Task) -> tuple[Decimal, ...] | None:
     model = task.model_name
     if model == "openai/deepseek-flash":
         model = "deepseek/deepseek-flash"
-    if model != "deepseek/deepseek-flash" or task.token_breakdown.unknown_rounds:
+    tokens = task.token_breakdown
+    if (
+        model != "deepseek/deepseek-flash"
+        or tokens.unknown_rounds
+        or tokens.input_covered != tokens.covered
+        or tokens.output_covered != tokens.covered
+    ):
         return None
     rates = litellm.model_cost.get(model, {})
     keys = ("input_cost_per_token", "input_cost_per_token_cache_hit", "output_cost_per_token")
@@ -226,10 +230,14 @@ th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid 
 {% set tokens = item.task.token_breakdown %}
 {% set calls = [tokens.responses, item.task.api_calls or 0] | max %}
 {% set coverage %}覆盖 {{ tokens.covered }} / {{ calls }} 次 API 调用{% endset %}
-{% set usage_missing %}其余 {{ calls - tokens.covered }} 次调用缺少有效的输入或输出 Token 数。{% endset %}
-<section><h2>Token 构成</h2>
-{% if tokens.covered %}
-<p><strong>{{ '{:,}'.format(tokens.uncached + tokens.cached + tokens.unknown_input + tokens.output) }} Token</strong> · {{ coverage }}</p>
+{% set usage_missing %}{{ calls - tokens.covered }} 次调用的输入或输出用量记录不完整，各项已知用量仍计入累计值。{% endset %}
+<section><h2>API Token 用量</h2>
+<p>累计输入 <strong>{{ '{:,}'.format(tokens.input) if tokens.input_covered else '不可用' }}</strong> Token · 输入记录覆盖 {{ tokens.input_covered }} / {{ calls }} 次调用</p>
+<p>累计输出 <strong>{{ '{:,}'.format(tokens.output) if tokens.output_covered else '不可用' }}</strong> Token · 输出记录覆盖 {{ tokens.output_covered }} / {{ calls }} 次调用</p>
+{% if tokens.input_covered < calls %}<p class="warning">输入总量仅包含已记录 usage 的调用，其余 {{ calls - tokens.input_covered }} 次调用的输入用量不可用。</p>{% endif %}
+<p class="note">输入累计包含缓存命中和未命中 Token。每次请求按该次 API 返回的 usage 计入一次。</p>
+{% if tokens.input_covered or tokens.output_covered %}
+<p><strong>{{ '{:,}'.format(tokens.input + tokens.output) }} 输入与输出 Token</strong> · 输入记录覆盖 {{ tokens.input_covered }} / {{ calls }} 次，输出记录覆盖 {{ tokens.output_covered }} / {{ calls }} 次</p>
 {{ breakdown_bar([tokens.uncached, tokens.cached, tokens.output], '{:,}', ' Token', tokens.unknown_input) }}
 {% if tokens.unknown_rounds %}<p class="note">{{ tokens.unknown_rounds }} 次调用缺少有效的缓存命中数，其输入归为「缓存状态未知」。</p>{% endif %}
 {% if tokens.covered < calls %}<p class="note">{{ usage_missing }}</p>{% endif %}
@@ -246,32 +254,12 @@ th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid 
 {% endif %}
 {% if item.task.cost == 0 %}<p class="note">原始费用记录为零，可能是运行时计价失败；分类金额为事后重建，实际扣款以官方账单为准。</p>{% endif %}
 </section>
-<section><h2>输入 Token 统计</h2>
-{% set tokens = item.task.input_tokens %}
-{% if tokens is not none %}
-<p>覆盖 {{ tokens.rounds }} 轮 · API 记录的输入 Token：{{ '{:,}'.format(tokens.api_prompt) if tokens.api_prompt is not none else '不可用' }}</p>
-<p>输入 Token 缓存命中率：{% if tokens.cache_hit_rate is not none %}<strong>{{ '{:.1%}'.format(tokens.cache_hit_rate) }}</strong>
-（{{ '{:,}'.format(tokens.cached_prompt) }} / {{ '{:,}'.format(tokens.cache_prompt) }} Token）{% else %}不可用{% endif %}
-· 缓存数据覆盖 {{ tokens.cache_rounds }} / {{ tokens.rounds }} 轮</p>
-{% if tokens.cache_rounds < tokens.rounds %}<p class="note">未上报有效缓存数据的轮次不计入命中率。</p>{% endif %}
-<div class="table-scroll"><table><thead><tr><th scope="col">消息类别</th><th scope="col">累计估算 Token</th><th scope="col">占估算输入</th></tr></thead><tbody>
-{% set tool = tokens.by_role.get('tool', 0) %}
-{% set assistant = tokens.by_role.get('assistant', 0) %}
-{% for label, count in [
-    ('system · 系统提示', tokens.by_role.get('system', 0)),
-    ('user · 用户消息', tokens.by_role.get('user', 0)),
-    ('assistant · 模型回复（含工具调用）', assistant),
-    ('tool · 工具返回', tool),
-    ('tool + assistant 小计', tool + assistant),
-    ('全部输入消息', tokens.total),
-] %}
-<tr><td>{{ label }}</td><td>{{ '{:,}'.format(count) }}</td><td>{{ '%.1f%%' | format(100 * count / tokens.total) }}</td></tr>
-{% endfor %}
-</tbody></table></div>
-<p class="note">使用 {{ encoding }} 按轨迹估算。历史消息每随请求发送一次就计一次。占比以本地估算的全部消息 Token 为分母，API 总数供参考。</p>
-{% else %}
-<p class="note">没有可用于重建请求的 Chat Completions 回复记录。</p>
-{% endif %}
+<section><h2>输入缓存命中率</h2>
+{% if tokens.cache_hit_rate is not none %}
+<p><strong>{{ '{:.1%}'.format(tokens.cache_hit_rate) }}</strong>（{{ '{:,}'.format(tokens.cached) }} / {{ '{:,}'.format(tokens.uncached + tokens.cached) }} 输入 Token）</p>
+{% else %}<p>不可用</p>{% endif %}
+<p class="note">缓存记录覆盖 {{ tokens.cache_rounds }} / {{ calls }} 次调用。命中率分母为已提供有效缓存用量的调用输入总量。</p>
+<p class="note">服务端 usage 未提供按 system、user、assistant、tool 拆分的用量。</p>
 </section></article>{% endfor %}
 <p class="note">轨迹费用（USD）由 LiteLLM 在运行时记录。
 仅支持单个日志内 --workers 1 的串行运行；不同独立日志可以汇总。报告为生成时的快照，不会自动刷新。</p>
@@ -282,7 +270,7 @@ buttons.forEach(button => button.addEventListener('click', () => {
   buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
   panels.forEach(panel => { panel.hidden = panel.id !== 'task-' + button.dataset.task; });
 }));
-</script></body></html>''').render(items=items, encoding=ENCODING)
+</script></body></html>''').render(items=items)
 
 
 def main(
