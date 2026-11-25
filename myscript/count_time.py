@@ -49,6 +49,7 @@ class Task:
     token_breakdown: TokenBreakdown = field(default_factory=TokenBreakdown)
     model_name: str | None = None
     benchmark_status: str | None = None
+    tool_result_window: str = "未记录"
 
 
 def parse_event(match: re.Match) -> Event:
@@ -77,7 +78,18 @@ def add_trajectory(task: Task, path: Path | None) -> None:
     if data.get("instance_id", task.id) != task.id:
         raise typer.BadParameter(f"轨迹 ID 与日志不一致：{path}")
     info = data.get("info", {})
-    task.model_name = (info.get("config", {}).get("model") or {}).get("model_name")
+    config = info.get("config", {})
+    model = config.get("model") or {}
+    agent = config.get("agent") or {}
+    task.model_name = model.get("model_name")
+    for settings, key in ((agent, "tool_result_retention_rounds"), (model, "tool_result_keep_rounds")):
+        if key in settings:
+            value = settings[key]
+            if value is None:
+                task.tool_result_window = "不限"
+            elif type(value) is int and value >= 0:
+                task.tool_result_window = str(value)
+            break
     stats = info.get("model_stats", {})
     task.cost = finite_number(stats.get("instance_cost"))
     task.api_calls = stats.get("api_calls")

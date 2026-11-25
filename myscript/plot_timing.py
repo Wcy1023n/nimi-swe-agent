@@ -5,18 +5,17 @@ from decimal import Decimal
 from html import escape
 from pathlib import Path
 
+import litellm
 import typer
-import yaml
 from jinja2 import Environment
 
 if __package__:
-    from .count_time import Task, analyze, finite_number, read_tasks
+    from .count_time import Task, analyze, read_tasks
     from .count_tokens import ENCODING
 else:
-    from count_time import Task, analyze, finite_number, read_tasks
+    from count_time import Task, analyze, read_tasks
     from count_tokens import ENCODING
 
-PRICE_FILE = Path(__file__).with_name("model_prices.yaml")
 COLORS = {"query": "#2563eb", "tool": "#94a3b8", "other": "#e2e8f0"}
 TEMPLATE = Environment(autoescape=True)
 
@@ -126,33 +125,32 @@ query 包含模型请求及 agent 前后处理。位置由日志结束时间减�
 ''').render(circles="".join(circles), rows="".join(rows), total=stats["total"], scope=stats["scope"], cost=money(task.cost), timeline=timeline(task, stats))
 
 
-def estimate_price(task: Task, rates: dict, tokens_per_unit: int) -> tuple[Decimal, ...] | None:
-    model_rates = rates.get(task.model_name)
-    if model_rates is None:
+def price_breakdown(task: Task) -> tuple[Decimal, ...] | None:
+    model = task.model_name
+    if model == "openai/deepseek-flash":
+        model = "deepseek/deepseek-flash"
+    if model != "deepseek/deepseek-flash" or task.token_breakdown.unknown_rounds:
         return None
-    keys = ("uncached_input", "cached_input", "output")
-    if any(finite_number(model_rates.get(key)) is None for key in keys):
-        raise typer.BadParameter(f"{PRICE_FILE.name}: {task.model_name} 需要三项非负单价：{', '.join(keys)}。")
+    rates = litellm.model_cost.get(model, {})
+    keys = ("input_cost_per_token", "input_cost_per_token_cache_hit", "output_cost_per_token")
+    if any(rates.get(key) is None for key in keys):
+        return None
     tokens = task.token_breakdown
     return tuple(
-        count * Decimal(str(model_rates[key])) / tokens_per_unit
-        for count, key in zip((tokens.uncached + tokens.unknown_input, tokens.cached, tokens.output), keys)
+        count * Decimal(str(rates[key]))
+        for count, key in zip(
+            (tokens.uncached, tokens.cached, tokens.output),
+            keys,
+        )
     )
 
 
 def render_report(tasks: list[Task]) -> str:
-    pricing = yaml.safe_load(PRICE_FILE.read_text(encoding="utf-8"))
-    tokens_per_unit = pricing["tokens_per_unit"]
-    if type(tokens_per_unit) is not int or tokens_per_unit <= 0:
-        raise typer.BadParameter(f"{PRICE_FILE.name}: tokens_per_unit 必须是正整数。")
-    currency = pricing["currency"]
-    price_format = ("¥" if currency == "CNY" else f"{currency} ") + "{:,.6f}"
     items = []
     for task in tasks:
         stats = analyze(task)
         items.append({"task": task, "stats": stats, "duration": f'{stats["total"]:.3f} s' if stats["total"] is not None else "不可用",
-                      "money": money(task.cost), "preview": timeline(task, stats, compact=True), "charts": charts(task, stats),
-                      "price": estimate_price(task, pricing["models"], tokens_per_unit)})
+                      "price": price_breakdown(task), "money": money(task.cost), "preview": timeline(task, stats, compact=True), "charts": charts(task, stats)})
     return TEMPLATE.from_string('''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent 多题耗时与 Token 分析</title><style>
@@ -161,11 +159,11 @@ h1 { margin-bottom:0; } h2 { margin-top:0; } section { background:white; border:
 .task-list { max-height:300px; overflow-y:auto; display:grid; gap:8px; padding:4px; }
 .task-button { display:grid; grid-template-columns:minmax(180px,1fr) minmax(150px,1.2fr) 130px; gap:16px; align-items:center; width:100%; padding:12px; border:1px solid #cbd5e1; border-radius:8px; background:white; color:inherit; text-align:left; cursor:pointer; font:inherit; }
 .task-button[aria-pressed="true"] { border-color:#2563eb; background:#eff6ff; box-shadow:0 0 0 1px #2563eb; }
-.task-button[data-benchmark="passed"] { border-inline-start:4px solid #15803d; background:#f0fdf4; }
-.task-button:is([data-benchmark="failed"], [data-benchmark="empty-patch"]) { border-inline-start:4px solid #b91c1c; background:#fef2f2; }
+.task-button[data-result="passed"] { border-inline-start:4px solid #15803d; background:#dcfce7; }
+.task-button[data-result="failed"] { border-inline-start:4px solid #b91c1c; background:#fee2e2; }
 .bench-status { display:block; color:#475569; font-size:13px; }
-[data-benchmark="passed"] .bench-status { color:#166534; }
-:is([data-benchmark="failed"], [data-benchmark="empty-patch"]) .bench-status { color:#991b1b; }
+[data-result="passed"] .bench-status { color:#166534; }
+[data-result="failed"] .bench-status { color:#991b1b; }
 .task-button:focus-visible { outline:3px solid #2563eb; outline-offset:2px; }
 .task-name { display:block; font-size:13px; color:#475569; overflow-wrap:anywhere; } .task-id { overflow-wrap:anywhere; }
 .preview svg { width:100%; height:20px; display:block; border-radius:3px; } .metrics { text-align:right; font-size:14px; }
@@ -210,15 +208,19 @@ th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid 
 缩略轴各自压缩到相同宽度，仅比较阶段分布；跨题总耗时请看秒数。</p>
 {% set benchmark_labels = {'passed': '评测成功', 'failed': '评测失败', 'empty-patch': '评测失败 · 空补丁', 'error': '评测出错'} %}
 <div class="task-list" aria-label="题目列表">
-{% for item in items %}<button type="button" class="task-button" data-benchmark="{{ item.task.benchmark_status or 'unknown' }}" data-task="{{ loop.index0 }}" aria-controls="task-{{ loop.index0 }}" aria-pressed="{{ 'true' if loop.first else 'false' }}">
-<span><strong class="task-id">{{ item.task.id }}</strong><span class="bench-status">{{ benchmark_labels.get(item.task.benchmark_status, '无评测结果') }}</span><span class="task-name">{{ item.task.title }}</span><span class="task-name">{{ item.task.source }}</span></span>
+{% for item in items %}
+{% set benchmark = item.task.benchmark_status %}
+{% set run_failed = item.task.status not in ('未知', '未完成', 'Submitted') %}
+{% set result = 'passed' if benchmark == 'passed' else ('failed' if benchmark in ('failed', 'empty-patch', 'error') or run_failed else 'unknown') %}
+<button type="button" class="task-button" data-result="{{ result }}" data-task="{{ loop.index0 }}" aria-controls="task-{{ loop.index0 }}" aria-pressed="{{ 'true' if loop.first else 'false' }}">
+<span><strong class="task-id">{{ item.task.id }}</strong><span class="bench-status">{{ benchmark_labels.get(benchmark, '运行失败 · ' ~ item.task.status if run_failed else '无评测结果') }}</span><span class="task-name">{{ item.task.title }}</span><span class="task-name">{{ item.task.source }} · k={{ item.task.tool_result_window }}</span></span>
 <span class="preview">{{ item.preview | safe }}</span><span class="metrics">{{ item.duration }}<br>轨迹 {{ item.money }}</span></button>{% endfor %}
 </div></section>
 {% for item in items %}<article id="task-{{ loop.index0 }}" class="task-panel" {% if not loop.first %}hidden{% endif %}>
 <h2>{{ item.task.id }}</h2><p>{{ item.task.title }}</p><p class="note">来源：{{ item.task.source }}</p>
 <div class="summary"><strong>{{ item.stats.scope }}：{{ item.duration }}</strong>
 {% if item.stats.total is none %}<strong>轨迹总费用：{{ item.money }}</strong>{% endif %}
-<span>API 调用：{{ item.task.api_calls if item.task.api_calls is not none else '不可用' }}</span><span>Agent 状态：{{ item.task.status }}</span></div>
+<span>API 调用：{{ item.task.api_calls if item.task.api_calls is not none else '不可用' }}</span><span>Agent 状态：{{ item.task.status }}</span><span>工具结果保留轮数：k={{ item.task.tool_result_window }}</span></div>
 {% for warning in item.stats.warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
 {{ item.charts | safe }}
 {% set tokens = item.task.token_breakdown %}
@@ -236,15 +238,13 @@ th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid 
 {% endif %}
 </section>
 <section><h2>费用构成</h2>
-{% if item.price is none %}
-<p class="note">{% if item.task.model_name %}{{ item.task.model_name }} 在 {{ price_file }} 中没有单价配置。{% else %}轨迹中未记录模型名。{% endif %}</p>
-{% elif tokens.covered %}
-<p>中转站估算小计 <strong>{{ price_format.format(item.price | sum) }}</strong> · {{ coverage }}</p>
-{{ breakdown_bar(item.price, price_format) }}
-<p class="note">按 {{ price_file }} 中 {{ item.task.model_name }} 的单价估算（{{ currency }}）。{% if tokens.unknown_rounds %}这 {{ tokens.unknown_rounds }} 次缺少有效缓存命中数的输入按未命中单价估算。{% endif %}{% if tokens.covered < calls %}{{ usage_missing }}{% endif %}</p>
-{% else %}
-<p class="note">没有同时提供有效输入和输出 Token 数的调用（{{ coverage }}）。</p>
+<p>LiteLLM 原始记录总费用 <strong>{{ item.money }} USD</strong></p>
+{% if item.price is not none and tokens.covered %}
+<p>按 LiteLLM 当前价表重建 <strong>{{ '${:,.6f}'.format(item.price | sum) }} USD</strong> · {{ coverage }}</p>
+{{ breakdown_bar(item.price, '${:,.6f}') }}
+<p class="note">分类金额使用 API Token 用量和 LiteLLM 的 DeepSeek Flash 价表计算，原始总费用读取轨迹记录。</p>
 {% endif %}
+{% if item.task.cost == 0 %}<p class="note">原始费用记录为零，可能是运行时计价失败；分类金额为事后重建，实际扣款以官方账单为准。</p>{% endif %}
 </section>
 <section><h2>输入 Token 统计</h2>
 {% set tokens = item.task.input_tokens %}
@@ -273,7 +273,7 @@ th:first-child,td:first-child { text-align:left; } tr { border-bottom:1px solid 
 <p class="note">没有可用于重建请求的 Chat Completions 回复记录。</p>
 {% endif %}
 </section></article>{% endfor %}
-<p class="note">轨迹费用（USD）由 LiteLLM 在运行时记录。中转站估算（{{ currency }}）使用报告生成时的配置单价和用量覆盖范围。
+<p class="note">轨迹费用（USD）由 LiteLLM 在运行时记录。
 仅支持单个日志内 --workers 1 的串行运行；不同独立日志可以汇总。报告为生成时的快照，不会自动刷新。</p>
 <script>
 const buttons = document.querySelectorAll('.task-button');
@@ -282,7 +282,7 @@ buttons.forEach(button => button.addEventListener('click', () => {
   buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
   panels.forEach(panel => { panel.hidden = panel.id !== 'task-' + button.dataset.task; });
 }));
-</script></body></html>''').render(items=items, encoding=ENCODING, price_format=price_format, currency=currency, price_file=PRICE_FILE.name)
+</script></body></html>''').render(items=items, encoding=ENCODING)
 
 
 def main(
