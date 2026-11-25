@@ -5,7 +5,7 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
@@ -63,6 +63,7 @@ def main(
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT),
     output: Path | None = typer.Option(DEFAULT_OUTPUT_FILE, "-o", "--output", help="Output trajectory file"),
     exit_immediately: bool = typer.Option(False, "--exit-immediately", help="Exit immediately when the agent wants to finish instead of prompting.", rich_help_panel="Advanced"),
+    k: Annotated[int | None, typer.Option("--k", min=0, help="Keep tool results for K assistant rounds. 0 or omitted keeps all results.")] = None,
 ) -> Any:
     # fmt: on
     configure_if_first_time()
@@ -75,6 +76,7 @@ def main(
             "task": task or UNSET,
         },
         "agent": {
+            "tool_result_retention_rounds": k,
             "agent_class": agent_class or UNSET,
             "mode": "yolo" if yolo else UNSET,
             "cost_limit": cost_limit if cost_limit is not None else UNSET,

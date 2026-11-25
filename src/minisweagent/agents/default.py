@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 
 from jinja2 import StrictUndefined, Template
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
@@ -32,6 +32,8 @@ class AgentConfig(BaseModel):
     """Stop agent after this many seconds of wall-clock time. 0 means no limit."""
     max_consecutive_format_errors: int = 3
     """Exit after this many format errors in a row (0 = no limit)."""
+    tool_result_retention_rounds: int | None = Field(default=None, ge=0)
+    """Keep tool results from the latest N assistant replies. 0 or None keeps all results."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
 
@@ -71,6 +73,19 @@ class DefaultAgent:
         self.logger.debug(messages)  # set log level to debug to see
         self.messages.extend(messages)
         return list(messages)
+
+    def _prune_tool_results(self, window: int) -> None:
+        age = 0
+        for message in reversed(self.messages):
+            if message.get("role") == "assistant" or message.get("object") == "response":
+                age += 1
+                if age >= 2 * window:
+                    break
+            elif age >= window:
+                if message.get("role") == "tool":
+                    message["content"] = "[tool result is clean,please redo]"
+                elif message.get("type") == "function_call_output":
+                    message["output"] = "[tool result is clean,please redo]"
 
     def handle_uncaught_exception(self, e: Exception) -> list[dict]:
         return self.add_messages(
@@ -148,6 +163,8 @@ class DefaultAgent:
                     "extra": {"exit_status": "TimeExceeded", "submission": ""},
                 }
             )
+        if self.config.tool_result_retention_rounds:
+            self._prune_tool_results(self.config.tool_result_retention_rounds)
         self.n_calls += 1
         message = self.model.query(self.messages)
         self.cost += message.get("extra", {}).get("cost", 0.0)

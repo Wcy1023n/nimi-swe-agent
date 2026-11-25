@@ -407,6 +407,52 @@ def test_observations_captured(model_factory):
     assert "second" in observations[1]
 
 
+@pytest.mark.parametrize(("factory",), [(make_tc_model,), (make_response_api_model,)])
+@pytest.mark.parametrize(
+    ("window", "expected_cleaned"),
+    [
+        (None, [0, 0, 0, 0, 0]),
+        (0, [0, 0, 0, 0, 0]),
+        (1, [0, 0, 2, 2, 3]),
+        (2, [0, 0, 0, 2, 2]),
+    ],
+)
+def test_tool_result_retention_by_assistant_round(factory, window, expected_cleaned, toolcall_config):
+    agent = DefaultAgent(
+        model=factory(
+            [
+                ("First reply", [{"command": "echo first"}, {"command": "echo second"}]),
+                ("Reply without tools", []),
+                ("Third reply", [{"command": "echo third"}]),
+                ("Fourth reply", []),
+                ("Fifth reply", []),
+            ]
+        ),
+        env=LocalEnvironment(),
+        **{**toolcall_config, "cost_limit": 0},
+        tool_result_retention_rounds=window,
+    )
+    user_message = {"role": "user", "content": "User follow-up"}
+    for round_number, expected in enumerate(expected_cleaned, start=1):
+        agent.add_messages(user_message)
+        agent.step()
+        messages = agent.serialize()["messages"]
+        results = [msg for msg in messages if is_observation_message(msg)]
+        assert sum(get_observation_text(msg) == "[tool result is clean,please redo]" for msg in results) == expected
+        assert len(results) == (3 if round_number >= 3 else 2)
+        assert messages.count(user_message) == round_number
+        assert sum(is_assistant_message(msg) for msg in messages) == round_number
+        calls = [call["id"] for msg in messages for call in msg.get("tool_calls", [])]
+        calls += [
+            item["call_id"]
+            for msg in messages
+            if msg.get("object") == "response"
+            for item in msg["output"]
+            if item.get("type") == "function_call"
+        ]
+        assert calls == [msg.get("tool_call_id") or msg["call_id"] for msg in results]
+
+
 def test_wall_time_limit_enforcement(model_factory):
     """Test agent stops when wall-clock time limit is reached."""
     factory, config = model_factory

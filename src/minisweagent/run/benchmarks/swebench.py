@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from jinja2 import StrictUndefined, Template
@@ -212,6 +213,7 @@ def main(
     redo_existing: bool = typer.Option(False, "--redo-existing", help="Redo existing instances", rich_help_panel="Data selection"),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT, rich_help_panel="Basic"),
     environment_class: str | None = typer.Option(None, "--environment-class", help="Environment type to use. Recommended are docker or singularity", rich_help_panel="Advanced"),
+    k: Annotated[int | None, typer.Option("--k", min=0, help="Keep tool results for K assistant rounds. 0 or omitted keeps all results.")] = None,
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -235,6 +237,7 @@ def main(
     logger.info(f"Building agent config from specs: {config_spec}")
     configs = [get_config_from_spec(spec) for spec in config_spec]
     configs.append({
+        "agent": {"tool_result_retention_rounds": k},
         "environment": {"environment_class": environment_class or UNSET},
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
     })
