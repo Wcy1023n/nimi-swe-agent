@@ -1,0 +1,5 @@
+agent:
+  step_limit: 80
+  wall_time_limit_seconds: 900
+environment:
+  environment_class: minisweagent.environments.rtk.RTKEnvironment
