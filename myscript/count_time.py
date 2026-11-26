@@ -10,9 +10,9 @@ from pathlib import Path
 import typer
 
 if __package__:
-    from .count_tokens import TokenBreakdown, api_prompt_tokens, count_token_breakdown
+    from .count_tokens import TokenBreakdown, api_cached_prompt_tokens, api_prompt_tokens, count_token_breakdown, message_size, recorded_response
 else:
-    from count_tokens import TokenBreakdown, api_prompt_tokens, count_token_breakdown
+    from count_tokens import TokenBreakdown, api_cached_prompt_tokens, api_prompt_tokens, count_token_breakdown, message_size, recorded_response
 
 PATTERN = re.compile(
     r"^(?P<end>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - .*? - "
@@ -44,11 +44,14 @@ class Task:
     api_calls: int | None = None
     query_costs: dict[int, float] = field(default_factory=dict)
     query_input_tokens: dict[int, int] = field(default_factory=dict)
+    message_sizes: list[dict] = field(default_factory=list)
+    query_contexts: dict[int, dict] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     token_breakdown: TokenBreakdown = field(default_factory=TokenBreakdown)
     model_name: str | None = None
     benchmark_status: str | None = None
     tool_result_window: str = "未记录"
+    rtk_enabled: bool | None = None
 
 
 def parse_event(match: re.Match) -> Event:
@@ -76,12 +79,26 @@ def add_trajectory(task: Task, path: Path | None) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("instance_id", task.id) != task.id:
         raise typer.BadParameter(f"轨迹 ID 与日志不一致：{path}")
+    add_metadata(task, data)
+    task.token_breakdown = count_token_breakdown(data.get("messages", []))
+    records, task.message_sizes = collect_query_records(data.get("messages", []))
+    match_query_records(task, records)
+
+
+@dataclass
+class QueryRecord:
+    extra: dict
+    tokens: int | None
+    context: dict | None
+
+
+def add_metadata(task: Task, data: dict) -> None:
     info = data.get("info", {})
     config = info.get("config", {})
     model = config.get("model") or {}
     agent = config.get("agent") or {}
     task.model_name = model.get("model_name")
-    for settings, key in ((agent, "tool_result_retention_rounds"), (model, "tool_result_keep_rounds")):
+    for settings, key in ((model, "tool_result_tail_rounds"), (agent, "tool_result_retention_rounds"), (model, "tool_result_keep_rounds")):
         if key in settings:
             value = settings[key]
             if value is None:
@@ -94,7 +111,11 @@ def add_trajectory(task: Task, path: Path | None) -> None:
     task.api_calls = stats.get("api_calls")
     task.status = info.get("exit_status") or "未完成"
     messages = data.get("messages", [])
-    task.token_breakdown = count_token_breakdown(messages)
+    environment_type = config.get("environment_type") or (config.get("environment") or {}).get("environment_class")
+    if environment_type:
+        task.rtk_enabled = environment_type.endswith("RTKEnvironment")
+    if any("rtk_command" in message.get("extra", {}) for message in messages):
+        task.rtk_enabled = True
     prompt = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
     description = re.search(r"<pr_description>(.*?)</pr_description>", prompt, re.DOTALL) if isinstance(prompt, str) else None
     task.title = next(
@@ -102,31 +123,55 @@ def add_trajectory(task: Task, path: Path | None) -> None:
         task.id,
     ) if description else task.id
 
-    queries = [event for event in task.events if event.kind == "query"]
-    records = []
+
+def collect_query_records(messages: list[dict]) -> tuple[list[QueryRecord], list[dict]]:
+    records: list[QueryRecord] = []
+    sizes: list[dict] = []
     for message in messages:
         extra = message.get("extra", {})
-        tokens = api_prompt_tokens(message if message.get("object") == "response" else extra.get("response"))
+        tokens = api_prompt_tokens(recorded_response(message))
         if "cost" in extra or tokens is not None:
-            records.append((extra, tokens))
+            context = None
+            if message.get("role") == "assistant" and isinstance(extra.get("response"), dict):
+                context = {
+                    "end": len(sizes),
+                    "cached": api_cached_prompt_tokens(extra["response"].get("usage") or {}, tokens) if tokens is not None else None,
+                }
+                if isinstance(extra.get("request_messages"), list):
+                    context["messages"] = [
+                        message_size(item) for item in extra["request_messages"]
+                        if item.get("role") in ("system", "user", "assistant", "tool")
+                    ]
+            records.append(QueryRecord(extra, tokens, context))
+        if message.get("role") in ("system", "user", "assistant", "tool"):
+            sizes.append(message_size(message))
+    return records, sizes
+
+
+def match_query_records(task: Task, records: list[QueryRecord]) -> None:
+    queries = [event for event in task.events if event.kind == "query"]
     candidates = []
-    for record, _ in records:
+    for entry in records:
+        record = entry.extra
         timestamp = finite_number(record.get("timestamp"))
         candidates.append([
             index for index, event in enumerate(queries)
             if timestamp is not None
             and event.start.timestamp() - TOLERANCE <= timestamp <= event.end.timestamp() + TOLERANCE
         ])
-    for (record, tokens), matches in zip(records, candidates):
+    for entry, matches in zip(records, candidates):
+        record, tokens = entry.extra, entry.tokens
         if len(matches) != 1 or sum(matches[0] in other for other in candidates) != 1:
             continue
         if (cost := finite_number(record.get("cost"))) is not None:
             task.query_costs[matches[0]] = cost
         if tokens is not None:
             task.query_input_tokens[matches[0]] = tokens
+        if entry.context is not None:
+            task.query_contexts[matches[0]] = entry.context
     if task.cost is None:
         task.warnings.append("轨迹没有有效的累计费用；不根据模型名猜测价格。")
-    if len(task.query_costs) != len(queries) or len(task.query_costs) != sum("cost" in record for record, _ in records):
+    if len(task.query_costs) != len(queries) or len(task.query_costs) != sum("cost" in entry.extra for entry in records):
         task.warnings.append("部分 Query 费用无法按时间戳唯一对应；未匹配的费用显示不可用，不按序号猜配。")
     if task.cost is not None and not math.isclose(sum(task.query_costs.values()), task.cost, abs_tol=1e-8):
         task.warnings.append("累计费用包含未匹配到色块的费用，可能来自格式错误等调用；以轨迹累计值为准。")
@@ -210,6 +255,29 @@ def read_tasks(log: Path, source: str, evaluation: Path | None = None) -> list[T
                 raise typer.BadParameter(f"{log}: run 区间重叠；仅支持 --workers 1 的串行日志。")
             previous_end = run.end
     return tasks
+
+
+def read_harbor_task(log: Path, source: str) -> Task:
+    path = log.with_name("mini-swe-agent.trajectory.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    replies = [message for message in data["messages"] if message.get("role") == "assistant"]
+    durations = re.findall(r"DefaultAgent\.query:\s*Elapsed time\s+([\d.]+)\s+secs", log.read_text())
+    if len(replies) != len(durations):
+        raise typer.BadParameter(f"{log}: Query 计时与 assistant 回复数量不匹配，无法确定消息归属。")
+    events = [
+        Event("query", datetime.fromtimestamp(reply["extra"]["timestamp"]), float(seconds))
+        for reply, seconds in zip(replies, durations)
+    ]
+    task = Task(data.get("instance_id") or log.parent.parent.name, source, events)
+    add_trajectory(task, path)
+    result_path = log.parent.parent / "result.json"
+    if result_path.is_file():
+        result = json.loads(result_path.read_text())
+        reward = ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+        if reward is not None:
+            task.benchmark_status = "passed" if reward == 1 else "failed"
+    task.warnings.append("Harbor 日志仅提供 Query 耗时，时间轴展示模型请求覆盖的观测区间，间隔归为其他处理。")
+    return task
 
 
 def analyze(task: Task) -> dict:

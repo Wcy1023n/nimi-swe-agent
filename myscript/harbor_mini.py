@@ -16,6 +16,13 @@ class LocalMini(MiniSweAgent):
     options_model = LocalMiniOptions
     options: LocalMiniOptions
 
+    @staticmethod
+    def _is_litellm_config(config: dict | None) -> bool:
+        return MiniSweAgent._is_litellm_config(config) or (
+            ((config or {}).get("model") or {}).get("model_class")
+            == "minisweagent.models.extra.tool_result_tail.ToolResultTailModel"
+        )
+
     async def install(self, environment: BaseEnvironment) -> None:
         wheel = Path(self.options.local_wheel).expanduser().resolve()
         if not (wheel.name.startswith("mini_swe_agent-") and wheel.suffix == ".whl" and wheel.is_file()):

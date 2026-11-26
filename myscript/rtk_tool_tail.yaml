@@ -1,0 +1,9 @@
+agent:
+  step_limit: 80
+  wall_time_limit_seconds: 900
+  tool_result_retention_rounds: 0
+environment:
+  environment_class: minisweagent.environments.rtk.RTKEnvironment
+model:
+  model_class: minisweagent.models.extra.tool_result_tail.ToolResultTailModel
+  tool_result_tail_rounds: 3

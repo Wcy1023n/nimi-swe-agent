@@ -18,6 +18,7 @@ timing-report*.html
 !/myscript/**/*.bash
 !/myscript/**/*.zsh
 !/myscript/model_prices.yaml
+!/myscript/rtk_tool_tail.yaml
 !/myscript/README.md
 !/myscript/rtk.yaml
 /myscript/results/
